@@ -1,26 +1,36 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+FastAPI + MongoDB (PyMongo). All code is in `app/main.py`.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Run
+    python -m venv .venv
+    .venv\Scripts\activate          (Mac/Linux: source .venv/bin/activate)
+    pip install -r requirements.txt
+    # create a .env file with:
+    #   MONGO_URI=<your MongoDB connection string>
+    #   MONGO_DB=attendance_db
+    python sample_seed.py
+    uvicorn app.main:app --port 8000 --reload
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+Docs page: http://localhost:8000/docs
 
-## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
-```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+## Done
+- `POST /attendance/punch-out`: finds the latest open record, validates (404/409/422),
+  computes work hours, overtime and half day, and saves with an atomic conditional
+  update so only one of two simultaneous punch-outs succeeds.
+- `PATCH /attendance/{emp_code}/{date}`: manual correction. Recomputes derived fields,
+  appends one history entry with from/to for every changed field, and uses an optimistic
+  check (history length + punch_out) so concurrent edits return 409 instead of losing history.
+- Fixed helpers: late minutes (R2), work hours with half-up rounding (R4),
+  overtime with the 30-minute minimum and overnight shifts (R3, R1).
+- Fixed pagination offset in `GET /employees`; MongoDB client now returns
+  timezone-aware datetimes.
+- Review findings are in `REVIEW.md`.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+## Not done yet
+- Analytics endpoints: employee monthly, department summary, late leaderboard, department trend.
+- `GET /admin/explain/{endpoint}` and index creation at startup.
+- Remaining fixes in the starter endpoints: `POST /attendance/punch-in` (IST date and
+  epoch-millisecond responses, race condition), `GET /attendance` (pagination, sorting, filters),
+  `POST /employees` (validation, unique index).
+- `DECISIONS.md` answers.
