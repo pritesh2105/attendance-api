@@ -10,11 +10,11 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
 
 load_dotenv()
@@ -38,10 +38,15 @@ def to_ist(ms: Optional[int]) -> datetime:
         dt = datetime.fromtimestamp(ms / 1000, tz=IST)
     return dt.replace(microsecond=0)
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    seconds = (punch_in - start).total_seconds()
+def compute_late_minutes(punch_in: datetime, shift_start: str, shift_end: str) -> int:
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
+    pin = punch_in.astimezone(IST).replace(microsecond=0)
+    start = pin.replace(hour=sh, minute=sm, second=0)
+    # overnight shift, punched in early morning: the shift started the previous day
+    if (eh, em) <= (sh, sm) and (pin.hour, pin.minute, pin.second) < (eh, em, 0):
+        start -= timedelta(days=1)
+    seconds = (pin - start).total_seconds()
     return int(seconds // 60) if seconds > 600 else 0
 
 
@@ -82,6 +87,25 @@ def record_view(rec: dict) -> dict:
         "history": rec.get("history", []),
     }
 
+def attendance_date(ts: datetime, shift_start: str, shift_end: str) -> str:
+    """R1: the IST calendar date a punch-in belongs to."""
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
+    t = ts.astimezone(IST)
+    d = t.date()
+    if (eh, em) <= (sh, sm) and (t.hour, t.minute, t.second) < (eh, em, 0):
+        d -= timedelta(days=1)
+    return d.isoformat()
+
+
+def derive(emp: dict, in_ts: Optional[datetime], out_ts: Optional[datetime]) -> dict:
+    late = compute_late_minutes(in_ts, emp["shift_start"], emp["shift_end"]) if in_ts else 0
+    if in_ts and out_ts:
+        wh = compute_work_hours(in_ts, out_ts)
+        ot = compute_overtime(in_ts, out_ts, emp["shift_start"], emp["shift_end"])
+        return {"late_minutes": late, "work_hours": wh, "overtime_minutes": ot, "half_day": wh < 4.5}
+    return {"late_minutes": late, "work_hours": None, "overtime_minutes": 0, "half_day": False}
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
@@ -102,6 +126,13 @@ class PunchInIn(BaseModel):
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
+
+class RegularizeIn(BaseModel):
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[int] = None
+    punch_out: Optional[int] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -147,7 +178,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], emp["shift_end"]),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
@@ -219,6 +250,67 @@ def punch_out(body: PunchOutIn):
     )
     if res.modified_count == 0:
         raise HTTPException(409, "already punched out")
+    return record_view(db.attendance_logs.find_one({"_id": rec["_id"]}))
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: str, body: RegularizeIn):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not rec:
+        raise HTTPException(404, "no record for that date")
+        shift_start, shift_end = emp["shift_start"], emp["shift_end"]
+    new_status = body.status or rec["status"]
+    old_in = rec.get("punch_in")
+    old_out = rec.get("punch_out")
+
+    if new_status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "ABSENT/LEAVE cannot have punch times")
+        new_in = new_out = None
+    else:
+        new_in = to_ist(body.punch_in) if body.punch_in is not None else old_in
+        new_out = to_ist(body.punch_out) if body.punch_out is not None else old_out
+        if new_in is None:
+            raise HTTPException(422, "a presence status requires a punch_in")
+        if attendance_date(new_in, shift_start, shift_end) != date:
+            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+        if new_out is not None and (new_out <= new_in or new_out - new_in > timedelta(hours=24)):
+            raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
+
+    new = {"status": new_status, "punch_in": new_in, "punch_out": new_out, **derive(emp, new_in, new_out)}
+    changes = {}
+    for k, v in new.items():
+        old = rec.get(k)
+        if v != old:
+            if k in ("punch_in", "punch_out"):
+                changes[k] = {"from": to_ms(old), "to": to_ms(v)}
+            else:
+                changes[k] = {"from": old, "to": v}
+    if not changes:
+        raise HTTPException(422, "request changes nothing")
+
+        entry = {
+        "at": to_ms(datetime.now(timezone.utc)),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+    old_history = rec.get("history", [])
+    res = db.attendance_logs.update_one(
+        {
+            "_id": rec["_id"],
+            "history": {"$size": len(old_history)},
+            "punch_out": old_out,
+        },
+        {
+            "$set": new,
+            "$push": {"history": entry},
+        },
+    )
+    if res.modified_count == 0:
+        raise HTTPException(409, "record was modified by someone else, please retry")
     return record_view(db.attendance_logs.find_one({"_id": rec["_id"]}))
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
